@@ -86,7 +86,7 @@ class AnkiDeckGenerator:
                         <div class="question">{{Question}}</div>
                         {{#Image}}
                         <div class="image">
-                            <img src="{{Image}}" style="max-width: 400px; max-height: 300px;">
+                            {{Image}}
                         </div>
                         {{/Image}}
                         <hr>
@@ -101,7 +101,7 @@ class AnkiDeckGenerator:
                         <div class="question">{{Question}}</div>
                         {{#Image}}
                         <div class="image">
-                            <img src="{{Image}}" style="max-width: 400px; max-height: 300px;">
+                            {{Image}}
                         </div>
                         {{/Image}}
                         <hr>
@@ -211,10 +211,10 @@ class AnkiDeckGenerator:
         topic = self._get_topic_from_question_number(question_data.number)
         deck = self._get_or_create_deck(topic)
 
-        # Prepare image field
+        # Prepare image field - store as HTML img tag
         image_field = ""
-        if question_data.image and image_path and image_path.exists():
-            image_field = question_data.image
+        if question_data.image:
+            image_field = f'<img src="{question_data.image}" style="max-width: 400px; max-height: 300px;">'
 
         # Get answers
         answer_a = question_data.answers.get('A', '')
@@ -259,7 +259,8 @@ class AnkiDeckGenerator:
 
         # Add media files (images)
         if media_files:
-            package.media_files = [str(f) for f in media_files if f.exists()]
+            valid_media = [str(f) for f in media_files if f.exists()]
+            package.media_files = valid_media
 
         # Save the package
         package.write_to_file(str(output_path))
@@ -321,6 +322,8 @@ def main(input_file: str, images_dir: str, output: str, deck_name: str) -> None:
                 image_path = images_path / question.image
                 if image_path.exists():
                     media_files.append(image_path)
+                else:
+                    click.echo(f"Warning: Image file not found: {image_path}")
 
             generator.add_question(question, image_path)
 
