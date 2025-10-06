@@ -44,11 +44,22 @@ class AnkiDeckGenerator:
     # Custom model ID (random but stable)
     MODEL_ID = 1607392319
 
-    # Deck ID (random but stable)
-    DECK_ID = 2059400110
+    # Base deck ID (random but stable)
+    BASE_DECK_ID = 2059400110
+
+    # Topic mappings
+    TOPIC_MAPPING = {
+        '1': 'Fischkunde',
+        '2': 'Gewässerkunde',
+        '3': 'Schutz und Pflege der Fischgewässer',
+        '4': 'Fanggeräte',
+        '5': 'Rechtsvorschriften',
+        'B': 'Bilder'
+    }
 
     def __init__(self, deck_name: str = "Bayerische Fischerprüfung 2025"):
         self.deck_name = deck_name
+        self.decks = {}  # Will store topic -> deck mapping
 
         # Define the note model (card template)
         self.model = genanki.Model(
@@ -172,15 +183,33 @@ class AnkiDeckGenerator:
             '''
         )
 
-        # Create deck
-        self.deck = genanki.Deck(self.DECK_ID, self.deck_name)
+        # Main deck will be created on demand
+
+    def _get_topic_from_question_number(self, question_number: str) -> str:
+        """Extract topic from question number."""
+        prefix = question_number[0]
+        return self.TOPIC_MAPPING.get(prefix, 'Unknown')
+
+    def _get_or_create_deck(self, topic: str) -> genanki.Deck:
+        """Get or create a subdeck for the given topic."""
+        if topic not in self.decks:
+            # Generate unique deck ID based on topic
+            deck_id = self.BASE_DECK_ID + hash(topic) % 1000000
+            # Use :: syntax for Anki subdecks
+            deck_name = f"{self.deck_name}::{topic}"
+            self.decks[topic] = genanki.Deck(deck_id, deck_name)
+        return self.decks[topic]
 
     def add_question(
         self,
         question_data: Question,
         image_path: Optional[Path] = None
     ) -> None:
-        """Add a question to the deck."""
+        """Add a question to the appropriate topic deck."""
+
+        # Get topic and corresponding deck
+        topic = self._get_topic_from_question_number(question_data.number)
+        deck = self._get_or_create_deck(topic)
 
         # Prepare image field
         image_field = ""
@@ -216,17 +245,25 @@ class AnkiDeckGenerator:
             ]
         )
 
-        self.deck.add_note(note)
+        deck.add_note(note)
 
     def save(self, output_path: Path, media_files: List[Path]) -> None:
-        """Save the deck as an .apkg file."""
-        package = genanki.Package(self.deck)
+        """Save all topic subdecks as one .apkg file."""
+        if not self.decks:
+            click.echo("No decks created. No questions were added.")
+            return
+
+        # Create package with all subdecks
+        all_decks = list(self.decks.values())
+        package = genanki.Package(all_decks)
 
         # Add media files (images)
         if media_files:
             package.media_files = [str(f) for f in media_files if f.exists()]
 
+        # Save the package
         package.write_to_file(str(output_path))
+        return output_path
 
 
 @click.command()
@@ -287,15 +324,42 @@ def main(input_file: str, images_dir: str, output: str, deck_name: str) -> None:
 
             generator.add_question(question, image_path)
 
-        click.echo(f"Added {len(questions_data)} questions to deck")
+        click.echo(f"Added {len(questions_data)} questions to decks")
         click.echo(f"Including {len(media_files)} images")
 
-        # Save deck
-        click.echo(f"Saving deck to {output_path}...")
-        generator.save(output_path, media_files)
+        # Display topic distribution and check for unknown topics
+        topic_counts = {}
+        unknown_questions = []
 
-        click.echo(f"\n✓ Successfully created Anki deck: {output_path}")
-        click.echo(f"\nImport this file into Anki to start studying!")
+        for q_data in questions_data:
+            question = Question(**q_data)
+            topic = generator._get_topic_from_question_number(question.number)
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+
+            if topic == 'Unknown':
+                unknown_questions.append(question.number)
+
+        click.echo("\nQuestions per topic:")
+        for topic, count in sorted(topic_counts.items()):
+            click.echo(f"  {topic}: {count} questions")
+
+        # Warn about unknown questions
+        if unknown_questions:
+            click.echo(f"\n⚠️  WARNING: {len(unknown_questions)} questions were not assigned to any topic:")
+            for q_num in unknown_questions[:10]:  # Show first 10
+                click.echo(f"  - {q_num}")
+            if len(unknown_questions) > 10:
+                click.echo(f"  ... and {len(unknown_questions) - 10} more")
+            click.echo("\nThese questions have prefixes not defined in TOPIC_MAPPING.")
+
+        # Save deck with subdecks
+        click.echo(f"\nSaving deck with subdecks...")
+        saved_file = generator.save(output_path, media_files)
+
+        if saved_file:
+            click.echo(f"\n✓ Successfully created Anki deck: {saved_file}")
+            click.echo(f"This deck contains {len(generator.decks)} subdecks organized by topic.")
+            click.echo(f"\nImport this file into Anki to start studying!")
 
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
