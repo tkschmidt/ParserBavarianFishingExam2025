@@ -105,7 +105,94 @@ class QuestionOutput(BaseModel):
     question: str
     answers: Dict[str, str]
     correct_answer: Optional[str] = None
+    question_coords: Optional[Dict[str, float]] = None  # Question bounding box coordinates
     image: Optional[str] = None  # Image filename for picture questions
+
+
+class ImageOutput(BaseModel):
+    """Output format for an image."""
+    image_id: str  # Unique identifier for the image
+    filename: str  # Image filename
+    page: int
+    coords: Dict[str, float]  # Image bounding box coordinates
+
+
+class ExamOutput(BaseModel):
+    """Complete exam output with questions and images."""
+    questions: List[QuestionOutput]
+    images: List[ImageOutput]
+
+
+def match_images_to_questions(questions: List[QuestionOutput], images: List[ImageOutput], images_dir: Path) -> Dict[str, str]:
+    """Match images to questions based on coordinates and rename files.
+
+    Returns a dict mapping question numbers to image filenames.
+    """
+    image_assignments = {}
+
+    # Filter to only picture questions (B-questions)
+    picture_questions = [q for q in questions if q.number.startswith('B')]
+
+    # Group by page for efficiency
+    questions_by_page = {}
+    images_by_page = {}
+
+    for question in picture_questions:
+        page = question.page
+        if page not in questions_by_page:
+            questions_by_page[page] = []
+        questions_by_page[page].append(question)
+
+    for image in images:
+        page = image.page
+        if page not in images_by_page:
+            images_by_page[page] = []
+        images_by_page[page].append(image)
+
+    # Process each page
+    for page_num in sorted(questions_by_page.keys()):
+        page_questions = questions_by_page[page_num]
+        page_images = images_by_page.get(page_num, [])
+
+        if not page_images:
+            click.echo(f"Warning: Page {page_num} has questions but no images")
+            continue
+
+        # Sort both by Y coordinate (top to bottom)
+        page_questions.sort(key=lambda q: q.question_coords['anchor_y'] if q.question_coords else 0)
+        page_images.sort(key=lambda img: img.coords['y0'])
+
+        # Match questions to images by position (top to bottom order)
+        for i, question in enumerate(page_questions):
+            if i >= len(page_images):
+                click.echo(f"Warning: No image available for question {question.number}")
+                continue
+
+            image = page_images[i]
+
+            # Determine file extension from original filename
+            original_path = images_dir / image.filename
+            if original_path.exists():
+                extension = original_path.suffix
+            else:
+                extension = '.jpg'  # default
+
+            # Create new filename based on question ID
+            new_filename = f"{question.number}{extension}"
+            new_path = images_dir / new_filename
+
+            try:
+                # Rename the file
+                if original_path.exists():
+                    original_path.rename(new_path)
+                    image_assignments[question.number] = new_filename
+                    click.echo(f"  Matched {question.number} -> {new_filename}")
+                else:
+                    click.echo(f"Warning: Original image file {image.filename} not found")
+            except Exception as e:
+                click.echo(f"Error renaming {image.filename} to {new_filename}: {e}")
+
+    return image_assignments
 
 
 
@@ -647,19 +734,19 @@ class FishingExamParserSimple:
         anchors: List[QuestionAnchor],
         output_dir: Path,
         max_pages: Optional[int] = None
-    ) -> Dict[str, str]:
+    ) -> List[ImageOutput]:
         """Extract images for picture questions (B-questions) and save them.
 
-        Returns a dict mapping question number to image filename.
+        Returns a list of ImageOutput objects with image IDs and coordinates.
         """
-        image_files = {}
+        image_outputs = []
 
         # Filter to only picture questions
         picture_questions = [a for a in anchors if a.number.startswith('B')]
 
         if not picture_questions:
             click.echo("No picture questions found")
-            return image_files
+            return image_outputs
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -688,6 +775,7 @@ class FishingExamParserSimple:
 
                     page = pdf.pages[page_num - 1]
                     page_questions = questions_by_page[page_num]
+                    page_height = page.height  # Get page height for coordinate conversion
 
                     # Get all images on this page
                     images = page.images
@@ -695,18 +783,15 @@ class FishingExamParserSimple:
                     if len(images) < len(page_questions):
                         click.echo(f"Warning: Page {page_num} has {len(images)} images but {len(page_questions)} questions")
 
-                    # Match images to questions by Y position
-                    for i, question in enumerate(page_questions):
-                        if i >= len(images):
-                            click.echo(f"Warning: No image found for question {question.number}")
-                            continue
-
-                        img_data = images[i]
+                    # Process all images on this page, creating unique IDs
+                    for img_idx, img_data in enumerate(images):
+                        # Create unique image ID
+                        image_id = f"page_{page_num}_img_{img_idx}"
 
                         # Get image format from stream
                         image_stream = img_data.get('stream')
                         if not image_stream:
-                            click.echo(f"Warning: No stream for image {i} on page {page_num}")
+                            click.echo(f"Warning: No stream for image {img_idx} on page {page_num}")
                             continue
 
                         # Determine file extension
@@ -722,8 +807,8 @@ class FishingExamParserSimple:
                         elif 'JPX' in str(img_filter):
                             extension = 'jp2'
 
-                        # Save image
-                        filename = f"{question.number}.{extension}"
+                        # Save image with unique filename
+                        filename = f"{image_id}.{extension}"
                         filepath = output_dir / filename
 
                         try:
@@ -734,19 +819,45 @@ class FishingExamParserSimple:
                             with open(filepath, 'wb') as f:
                                 f.write(img_bytes)
 
-                            image_files[question.number] = filename
-                            click.echo(f"  Saved {filename}")
+                            # Convert coordinates from bottom-based (PDFplumber) to top-based
+                            img_x0 = img_data.get('x0', 0)
+                            img_y0_bottom = img_data.get('y0', 0)  # Bottom of image in PDFplumber coords
+                            img_x1 = img_data.get('x1', 0)
+                            img_y1_bottom = img_data.get('y1', 0)  # Top of image in PDFplumber coords
+                            img_width = img_data.get('width', 0)
+                            img_height = img_data.get('height', 0)
+
+                            # Convert to top-based coordinates: top_y = page_height - bottom_y
+                            img_y0_top = page_height - img_y1_bottom  # Top of image in top-based coords
+                            img_y1_top = page_height - img_y0_bottom  # Bottom of image in top-based coords
+
+                            # Create ImageOutput object
+                            image_output = ImageOutput(
+                                image_id=image_id,
+                                filename=filename,
+                                page=page_num,
+                                coords={
+                                    'x0': img_x0,
+                                    'y0': img_y0_top,  # Top of image (top-based)
+                                    'x1': img_x1,
+                                    'y1': img_y1_top,  # Bottom of image (top-based)
+                                    'width': img_width,
+                                    'height': img_height
+                                }
+                            )
+                            image_outputs.append(image_output)
+                            click.echo(f"  Saved {filename} (ID: {image_id}) at ({img_x0:.1f}, {img_y0_top:.1f}) [top-based]")
 
                         except Exception as e:
-                            click.echo(f"  Error saving image for {question.number}: {e}")
+                            click.echo(f"  Error saving image {image_id}: {e}")
 
-                click.echo(f"Extracted {len(image_files)} images to {output_dir}")
+                click.echo(f"Extracted {len(image_outputs)} images to {output_dir}")
 
         except Exception as e:
             click.echo(f"Error extracting images: {e}", err=True)
             raise
 
-        return image_files
+        return image_outputs
 
 
 
@@ -838,7 +949,7 @@ def main(input_file: str, output: str, pages: Optional[int], debug: bool) -> Non
         # Step 8: Extract images for picture questions
         click.echo("\n=== Step 8: Extracting images for picture questions ===")
         images_dir = Path(output).parent / "images"
-        image_files = parser.extract_images_for_picture_questions(anchors, images_dir, max_pages=pages)
+        image_outputs = parser.extract_images_for_picture_questions(anchors, images_dir, max_pages=pages)
 
         if debug or True:
             print("\n=== Extracted Questions with Answers ===")
@@ -851,8 +962,10 @@ def main(input_file: str, output: str, pages: Optional[int], debug: bool) -> Non
                     marker = " ✓" if ans.answer_letter == correct else ""
                     print(f"  {ans.answer_letter}{marker}: {ans.text[:60]}..." if len(ans.text) > 60 else f"  {ans.answer_letter}{marker}: {ans.text}")
 
-        # Step 9: Build JSON output using Pydantic
-        click.echo(f"\n=== Step 9: Building JSON output ===")
+        # Step 9: Match images to questions and rename files
+        click.echo(f"\n=== Step 9: Matching images to questions ===")
+
+        # First, create initial question objects without images
         output_data = []
 
         for question in questions:
@@ -867,8 +980,18 @@ def main(input_file: str, output: str, pages: Optional[int], debug: bool) -> Non
             # Get correct answer
             correct = correct_answers.get(question.number)
 
-            # Get image filename if this is a picture question
-            image_file = image_files.get(question.number)
+            # Get question coordinates from the region
+            question_coords = None
+            if question.region:
+                question_coords = {
+                    'x_start': question.region.x_start,
+                    'x_end': question.region.x_end,
+                    'y_start': question.region.y_start,
+                    'y_end': question.region.y_end,
+                    'anchor_x': question.region.anchor.x,
+                    'anchor_y': question.region.anchor.y,
+                    'page': question.page
+                }
 
             # Create Pydantic model
             question_output = QuestionOutput(
@@ -877,24 +1000,39 @@ def main(input_file: str, output: str, pages: Optional[int], debug: bool) -> Non
                 question=question.text,
                 answers=answers_dict,
                 correct_answer=correct,
-                image=image_file
+                question_coords=question_coords
             )
             output_data.append(question_output)
+
+        # Match images to questions and rename files
+        if image_outputs:
+            image_assignments = match_images_to_questions(output_data, image_outputs, images_dir)
+
+            # Update question objects with image assignments
+            for question in output_data:
+                if question.number in image_assignments:
+                    question.image = image_assignments[question.number]
+
+        # Create the complete exam output with questions and images
+        exam_output = ExamOutput(
+            questions=output_data,
+            images=image_outputs
+        )
 
         # Write to JSON file using Pydantic
         output_path = Path(output)
         with output_path.open('w', encoding='utf-8') as f:
-            # Convert list of Pydantic models to JSON
-            json_data = [q.model_dump() for q in output_data]
-            json.dump(json_data, f, indent=2, ensure_ascii=False)
+            json.dump(exam_output.model_dump(), f, indent=2, ensure_ascii=False)
 
-        click.echo(f"Successfully wrote {len(output_data)} questions to {output}")
+        click.echo(f"Successfully wrote {len(output_data)} questions and {len(image_outputs)} images to {output}")
         click.echo(f"\nSummary:")
         click.echo(f"  Total questions: {len(questions)}")
         click.echo(f"  Total answers: {len(answers)}")
         click.echo(f"  Correct answers found: {len(correct_answers)}")
-        click.echo(f"  Picture question images: {len(image_files)}")
-        if image_files:
+        click.echo(f"  Picture question images: {len(image_outputs)}")
+        if image_outputs:
+            matched_images = len([q for q in output_data if q.image])
+            click.echo(f"  Images matched to questions: {matched_images}")
             click.echo(f"  Images saved to: {images_dir}")
 
     except Exception as e:

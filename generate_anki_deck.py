@@ -302,7 +302,10 @@ def main(input_file: str, images_dir: str, output: str, deck_name: str) -> None:
 
         # Load questions
         with input_path.open('r', encoding='utf-8') as f:
-            questions_data = json.load(f)
+            data = json.load(f)
+
+        # Extract questions from the new JSON structure
+        questions_data = data['questions']
 
         click.echo(f"Found {len(questions_data)} questions")
 
